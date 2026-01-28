@@ -3,7 +3,8 @@ export type MessageType =
   | "audio"
   | "text"
   | "control"
-  | "metadata";
+  | "metadata"
+  | "user_text";
 
 export const VERSIONS_MAP = {
   0: 0b00000000,
@@ -30,6 +31,7 @@ export type WSMessage =
   | {
       type: "text";
       data: string;
+      timestamp: number; // Unix timestamp in milliseconds
     }
   | {
       type: "control";
@@ -46,6 +48,19 @@ export type WSMessage =
   | {
     type:"ping";
   }
+  | {
+    type: "user_text";
+    data: string;
+    timestamp: number; // Unix timestamp in milliseconds
+  }
+
+// Conversation message for unified display
+export type ConversationMessage = {
+  id: string;
+  speaker: "user" | "assistant";
+  text: string;
+  timestamp: number;
+};
 
 
 export type SocketStatus = "connected" | "disconnected" | "connecting";

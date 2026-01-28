@@ -14,6 +14,7 @@ export const audioMessage: WSMessage = {
 export const textMessage: WSMessage = {
   type: "text",
   data: "Hello",
+  timestamp: Date.now(),
 };
 
 export const controlBOSMessage: WSMessage = {

@@ -29,6 +29,9 @@ export const encodeMessage = (message: WSMessage): Uint8Array => {
       return new Uint8Array([0x05, ...new TextEncoder().encode(message.data)]);
     case "ping":
       return new Uint8Array([0x06]);
+    case "user_text":
+      // User text is only received from server, not sent by client
+      return new Uint8Array([0x07, ...new TextEncoder().encode(message.data)]);
   }
 };
 
@@ -48,11 +51,27 @@ export const decodeMessage = (data: Uint8Array): WSMessage => {
         type: "audio",
         data: payload,
       };
-    case 0x02:
+    case 0x02: {
+      const decoded = new TextDecoder().decode(payload);
+      // Check if payload is JSON (new format with timestamp) or plain text (legacy)
+      if (decoded.startsWith("{")) {
+        try {
+          const parsed = JSON.parse(decoded);
+          return {
+            type: "text",
+            data: parsed.text || parsed.data || "",
+            timestamp: parsed.timestamp || Date.now(),
+          };
+        } catch {
+          // Fall through to plain text handling
+        }
+      }
       return {
         type: "text",
-        data: new TextDecoder().decode(payload),
+        data: decoded,
+        timestamp: Date.now(), // Use client timestamp for legacy messages
       };
+    }
     case 0x03: {
       const action = Object.keys(CONTROL_MESSAGES_MAP).find(
         key => CONTROL_MESSAGES_MAP[key as CONTROL_MESSAGE] === payload[0],
@@ -81,6 +100,27 @@ export const decodeMessage = (data: Uint8Array): WSMessage => {
       return {
         type: "ping",
       }
+    case 0x07: {
+      const decoded = new TextDecoder().decode(payload);
+      // Check if payload is JSON (new format with timestamp) or plain text (legacy)
+      if (decoded.startsWith("{")) {
+        try {
+          const parsed = JSON.parse(decoded);
+          return {
+            type: "user_text",
+            data: parsed.text || parsed.data || "",
+            timestamp: parsed.timestamp || Date.now(),
+          };
+        } catch {
+          // Fall through to plain text handling
+        }
+      }
+      return {
+        type: "user_text",
+        data: decoded,
+        timestamp: Date.now(), // Use client timestamp for legacy messages
+      };
+    }
     default: {
       console.log(type);
       throw new Error("Unknown message type");

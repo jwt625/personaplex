@@ -27,6 +27,7 @@
 import argparse
 import asyncio
 from dataclasses import dataclass
+import json
 import random
 import os
 from pathlib import Path
@@ -49,6 +50,7 @@ from .client_utils import make_log, colorize
 from .models import loaders, MimiModel, LMModel, LMGen
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog
+from .asr import ASRConfig, ASRTranscriber
 
 
 logger = setup_logger(__name__)
@@ -93,10 +95,13 @@ class ServerState:
     text_tokenizer: sentencepiece.SentencePieceProcessor
     lm_gen: LMGen
     lock: asyncio.Lock
+    asr: Optional[ASRTranscriber] = None
 
     def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
-                 save_voice_prompt_embeddings: bool = False):
+                 save_voice_prompt_embeddings: bool = False, enable_asr: bool = True,
+                 asr_device_index: int = 1, asr_buffer_duration: float = 4.0,
+                 asr_beam_size: int = 5, asr_vad_filter: bool = True):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
@@ -110,11 +115,28 @@ class ServerState:
                             frame_rate=self.mimi.frame_rate,
                             save_voice_prompt_embeddings=save_voice_prompt_embeddings,
         )
-        
+
         self.lock = asyncio.Lock()
         self.mimi.streaming_forever(1)
         self.other_mimi.streaming_forever(1)
         self.lm_gen.streaming_forever(1)
+
+        # Initialize ASR for user speech transcription
+        self.asr = None
+        if enable_asr:
+            asr_config = ASRConfig(
+                model_name="large-v3-turbo",
+                device="cuda",
+                device_index=asr_device_index,
+                compute_type="float16",
+                language="en",
+                beam_size=asr_beam_size,
+                vad_filter=asr_vad_filter,
+                buffer_duration_sec=asr_buffer_duration,
+                sample_rate=int(self.mimi.sample_rate),
+            )
+            self.asr = ASRTranscriber(asr_config)
+            self.asr.load_model()
     
     def warmup(self):
         for _ in range(4):
@@ -219,6 +241,11 @@ class ServerState:
                     be = time.time()
                     chunk = all_pcm_data[: self.frame_size]
                     all_pcm_data = all_pcm_data[self.frame_size:]
+
+                    # Feed user audio to ASR for transcription
+                    if self.asr is not None:
+                        self.asr.add_audio(chunk.copy())
+
                     chunk = torch.from_numpy(chunk)
                     chunk = chunk.to(device=self.device)[None, None]
                     codes = self.mimi.encode(chunk)
@@ -236,7 +263,12 @@ class ServerState:
                         if text_token not in (0, 3):
                             _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
                             _text = _text.replace("▁", " ")
-                            msg = b"\x02" + bytes(_text, encoding="utf8")
+                            # Send text with timestamp as JSON
+                            text_payload = json.dumps({
+                                "text": _text,
+                                "timestamp": int(time.time() * 1000)  # Unix timestamp in milliseconds
+                            })
+                            msg = b"\x02" + bytes(text_payload, encoding="utf8")
                             await ws.send_bytes(msg)
                         else:
                             text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
@@ -256,6 +288,17 @@ class ServerState:
         if len(request.query["voice_prompt"]) > 0:
             clog.log("info", f"voice prompt: {voice_prompt_path} (requested: {requested_voice_prompt_path})")
         close = False
+
+        # Queue for user transcripts from ASR
+        user_text_queue: asyncio.Queue = asyncio.Queue()
+
+        # Callback for ASR transcripts - puts text into queue for async sending
+        def on_user_transcript(text: str):
+            try:
+                user_text_queue.put_nowait(text)
+            except asyncio.QueueFull:
+                clog.log("warning", "user text queue full, dropping transcript")
+
         async with self.lock:
             if seed is not None and seed != -1:
                 seed_all(seed)
@@ -265,6 +308,14 @@ class ServerState:
             self.mimi.reset_streaming()
             self.other_mimi.reset_streaming()
             self.lm_gen.reset_streaming()
+
+            # Set up ASR for user speech transcription
+            if self.asr is not None:
+                self.asr.on_transcript = on_user_transcript
+                self.asr.reset()
+                self.asr.start(asyncio.get_event_loop())
+                clog.log("info", "ASR transcription started")
+
             async def is_alive():
                 if close or ws.closed:
                     return False
@@ -279,6 +330,29 @@ class ServerState:
                 except aiohttp.ClientConnectionError:
                     return False
                 return True
+
+            # Loop to send user transcripts via WebSocket (message type 0x07)
+            async def user_text_loop():
+                while True:
+                    if close:
+                        return
+                    try:
+                        text = await asyncio.wait_for(user_text_queue.get(), timeout=0.1)
+                        if text:
+                            # Send text with timestamp as JSON
+                            text_payload = json.dumps({
+                                "text": text,
+                                "timestamp": int(time.time() * 1000)  # Unix timestamp in milliseconds
+                            })
+                            msg = b"\x07" + bytes(text_payload, encoding="utf8")
+                            await ws.send_bytes(msg)
+                            clog.log("info", f"user transcript: {text}")
+                    except asyncio.TimeoutError:
+                        continue
+                    except Exception as e:
+                        clog.log("error", f"user text loop error: {e}")
+                        continue
+
             # Reuse mimi for encoding voice prompt and then reset it before conversation starts
             await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
             self.mimi.reset_streaming()
@@ -294,6 +368,10 @@ class ServerState:
                     asyncio.create_task(send_loop()),
                 ]
 
+                # Add user text loop if ASR is enabled
+                if self.asr is not None:
+                    tasks.append(asyncio.create_task(user_text_loop()))
+
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 # Force-kill remaining tasks
                 for task in pending:
@@ -302,6 +380,12 @@ class ServerState:
                         await task
                     except asyncio.CancelledError:
                         pass
+
+                # Stop ASR worker
+                if self.asr is not None:
+                    self.asr.stop()
+                    clog.log("info", "ASR transcription stopped")
+
                 await ws.close()
                 clog.log("info", "session closed")
                 # await asyncio.gather(opus_loop(), recv_loop(), send_loop())
@@ -390,8 +474,45 @@ def main():
             "that contains valid key.pem and cert.pem files"
         )
     )
+    parser.add_argument(
+        "--enable-asr",
+        action="store_true",
+        default=True,
+        help="Enable ASR for user speech transcription (default: enabled)"
+    )
+    parser.add_argument(
+        "--disable-asr",
+        action="store_true",
+        help="Disable ASR for user speech transcription"
+    )
+    parser.add_argument(
+        "--asr-device-index",
+        type=int,
+        default=1,
+        help="GPU index for ASR model (default: 1, use 0 if single GPU)"
+    )
+    parser.add_argument(
+        "--asr-buffer-duration",
+        type=float,
+        default=4.0,
+        help="ASR audio buffer duration in seconds (default: 4.0, longer = better accuracy but more latency)"
+    )
+    parser.add_argument(
+        "--asr-beam-size",
+        type=int,
+        default=5,
+        help="ASR beam size for decoding (default: 5, higher = better accuracy but slower)"
+    )
+    parser.add_argument(
+        "--asr-no-vad",
+        action="store_true",
+        help="Disable VAD filter in ASR (may help with mid-sentence cuts)"
+    )
 
     args = parser.parse_args()
+
+    # Handle ASR enable/disable flags
+    args.enable_asr = args.enable_asr and not args.disable_asr
     args.voice_prompt_dir = _get_voice_prompt_dir(
         args.voice_prompt_dir,
         args.hf_repo,
@@ -445,6 +566,12 @@ def main():
     lm = loaders.get_moshi_lm(args.moshi_weight, device=args.device, cpu_offload=args.cpu_offload)
     lm.eval()
     logger.info("moshi loaded")
+
+    if args.enable_asr:
+        logger.info(f"ASR enabled on GPU {args.asr_device_index}")
+    else:
+        logger.info("ASR disabled")
+
     state = ServerState(
         mimi=mimi,
         other_mimi=other_mimi,
@@ -453,6 +580,11 @@ def main():
         device=args.device,
         voice_prompt_dir=args.voice_prompt_dir,
         save_voice_prompt_embeddings=False,
+        enable_asr=args.enable_asr,
+        asr_device_index=args.asr_device_index,
+        asr_buffer_duration=args.asr_buffer_duration,
+        asr_beam_size=args.asr_beam_size,
+        asr_vad_filter=not args.asr_no_vad,
     )
     logger.info("warming up the model")
     state.warmup()
